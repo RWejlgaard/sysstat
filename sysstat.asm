@@ -9,6 +9,7 @@
 %define SYS_exit       60
 %define SYS_uname      63
 %define SYS_nanosleep  35
+%define SYS_statfs     137
 %define SYS_getdents64 217
 
 %define STDOUT 1
@@ -32,15 +33,15 @@ section .rodata
     reset_color      db 27, '[0m', 0
 
     usage_msg        db 'Usage: sysstat [OPTIONS]', 10
-                     db 'Show memory, CPU and network statistics', 10, 10
+                     db 'Show memory, CPU, disk and network statistics', 10, 10
                      db 'Options:', 10
                      db '  -m, --mem      Show only memory information', 10
                      db '  -c, --cpu      Show only CPU information', 10
                      db '  -n, --net      Show only network information', 10
                      db '  -a, --all      Show all information (default)', 10
-                     db '  -v, --verbose  Show extra details under each section', 10
+                     db '  -v, --verbose  No-op; extra details are shown by default now', 10
                      db '  -h, --help     Show this help message', 10, 10
-                     db 'Without any options, shows all information', 10
+                     db 'Without any options, shows all information with full detail', 10
     usage_len        equ $ - usage_msg
 
     unknown_opt_msg  db 'Unknown option: ', 0
@@ -66,6 +67,8 @@ section .rodata
     proc_cpuinfo_path db '/proc/cpuinfo', 0
     proc_uptime_path  db '/proc/uptime', 0
     proc_loadavg_path db '/proc/loadavg', 0
+    os_release_path   db '/etc/os-release', 0
+    root_path         db '/', 0
     net_class_dir     db '/sys/class/net/', 0
     stats_subdir      db 'statistics/', 0
     rx_bytes_file     db 'rx_bytes', 0
@@ -81,13 +84,17 @@ section .rodata
     key_swaptotal db 'SwapTotal:', 0
     key_swapfree  db 'SwapFree:', 0
 
-    key_modelname db 'model name', 0
-    key_cpumhz    db 'cpu MHz', 0
-    key_processor db 'processor', 0
+    key_modelname  db 'model name', 0
+    key_cpumhz     db 'cpu MHz', 0
+    key_processor  db 'processor', 0
+    key_cachesize  db 'cache size', 0
+
+    key_pretty_name db 'PRETTY_NAME=', 0
 
     ; Output fragments
     mem_label       db 'MEM  ', 0
     cpu_label       db 'CPU  ', 0
+    disk_label      db 'DISK ', 0
     net_label       db 'NET  ', 0
     sys_label       db 'SYS  ', 0
     down_label      db ' down ', 0
@@ -100,12 +107,16 @@ section .rodata
     threads_suffix  db ' threads', 0
     at_freq         db '  @ ', 0
     mhz_suffix      db 'MHz', 0
+    cache_prefix    db '  cache ', 0
     buffcache_label db 'buff/cache ', 0
     swap_label      db '  swap ', 0
     up_prefix       db 'up ', 0
     load_prefix     db '  load ', 0
+    procs_prefix    db '  procs ', 0
     net_rx_label    db ' rx ', 0
     net_tx_label    db ' tx ', 0
+    disk_root_label db '  /', 0
+    sep_line         db '--------------------------------------------', 10, 0
 
     sleep_ts     dq 0, INTERVAL_MS * 1000000   ; timespec {0, ms in ns}
 
@@ -145,6 +156,12 @@ section .bss
     mem_used_kb  resq 1
     mem_percent  resq 1
 
+    ; Disk (bytes, root filesystem)
+    disk_total   resq 1
+    disk_used    resq 1
+    disk_percent resq 1
+    statfs_buf   resb 128
+
     ; Directory scan (net interfaces)
     dirfd      resq 1
     dents_len  resq 1
@@ -173,6 +190,7 @@ section .bss
     cpuinfo_buf  resb CPUINFO_MAX + 1
     uptime_buf   resb 64
     loadavg_buf  resb 128
+    os_release_buf resb 2048
     num_buf      resb 40
     num_tmp      resb 32
     termios_buf  resb 64
@@ -197,6 +215,7 @@ section .text
 
 _start:
     mov byte [show_all], 1
+    mov byte [show_verbose], 1
 
     mov r12, [rsp]              ; argc
     lea r13, [rsp+8]            ; argv
@@ -679,6 +698,48 @@ sample_mem:
     mov [mem_percent], rax
     ret
 
+; ---------------------------------------------------------------------------
+; Disk sampling - statfs("/") for root filesystem usage
+; ---------------------------------------------------------------------------
+
+sample_disk:
+    mov eax, SYS_statfs
+    mov rdi, root_path
+    mov rsi, statfs_buf
+    syscall
+    test rax, rax
+    js .fail
+
+    mov rax, [statfs_buf + 16]   ; f_blocks
+    mov rcx, [statfs_buf + 72]   ; f_frsize
+    mul rcx                       ; total bytes
+    mov [disk_total], rax
+
+    mov rax, [statfs_buf + 16]   ; f_blocks
+    sub rax, [statfs_buf + 24]   ; - f_bfree = used blocks
+    mov rcx, [statfs_buf + 72]
+    mul rcx                       ; used bytes
+    mov [disk_used], rax
+
+    mov rcx, [disk_total]
+    test rcx, rcx
+    jz .zero
+    mov rax, [disk_used]
+    mov r9, 100
+    mul r9
+    div rcx
+    mov [disk_percent], rax
+    ret
+.zero:
+    mov qword [disk_percent], 0
+    ret
+.fail:
+    xor eax, eax
+    mov [disk_total], rax
+    mov [disk_used], rax
+    mov [disk_percent], rax
+    ret
+
 ; rdi = buffer start, rsi = key (e.g. "MemTotal:") -> rax = value, rdx = 1 if found
 find_field:
 .line:
@@ -755,6 +816,47 @@ find_text_field:
     jne .value
     inc rdi
     jmp .skip_sp
+.value:
+    mov rax, rdi
+    mov edx, 1
+    ret
+.next_line:
+    cmp byte [rdi], 0
+    je .fail
+    cmp byte [rdi], 10
+    je .adv
+    inc rdi
+    jmp .next_line
+.adv:
+    inc rdi
+    jmp .line
+.fail:
+    xor eax, eax
+    xor edx, edx
+    ret
+
+; rdi = buffer start, rsi = key ending in '=' (e.g. "PRETTY_NAME=")
+; -> rax = pointer to the value (leading quote stripped), rdx = 1 if found
+find_env_field:
+.line:
+    cmp byte [rdi], 0
+    je .fail
+    mov r8, rdi
+    mov r9, rsi
+.match:
+    mov al, [r9]
+    test al, al
+    jz .found
+    cmp al, [r8]
+    jne .next_line
+    inc r9
+    inc r8
+    jmp .match
+.found:
+    mov rdi, r8
+    cmp byte [rdi], '"'
+    jne .value
+    inc rdi
 .value:
     mov rax, rdi
     mov edx, 1
@@ -988,6 +1090,7 @@ render:
 .sys_check:
     cmp byte [show_verbose], 1
     jne .flush
+    call emit_disk_line
     call emit_sys_block
 
 .flush:
@@ -1001,7 +1104,18 @@ render:
 .ret:
     ret
 
+; Dashed divider before a section, but only if something was already
+; written - keeps sections apart without a leading or trailing divider.
+emit_sep_if_needed:
+    cmp rbx, out_buf
+    je .ret
+    mov rsi, sep_line
+    call emit_str
+.ret:
+    ret
+
 emit_mem_line:
+    call emit_sep_if_needed
     mov rsi, mem_label
     call emit_str
 
@@ -1035,6 +1149,7 @@ emit_mem_line:
     ret
 
 emit_cpu_line:
+    call emit_sep_if_needed
     mov rsi, cpu_label
     call emit_str
 
@@ -1055,6 +1170,7 @@ emit_cpu_line:
     ret
 
 emit_net_line:
+    call emit_sep_if_needed
     mov rsi, net_label
     call emit_str
 
@@ -1178,6 +1294,19 @@ emit_cpu_details:
     call emit_str
 .no_mhz:
 
+    mov rdi, cpuinfo_buf
+    mov rsi, key_cachesize
+    call find_text_field
+    test rdx, rdx
+    jz .no_cache
+    mov rsi, cache_prefix
+    call emit_str
+    mov rsi, rax
+    xor edx, edx
+    mov dl, 0
+    call emit_field_until
+.no_cache:
+
     call emit_nl
 .ret:
     ret
@@ -1231,12 +1360,47 @@ emit_net_details:
 .ret:
     ret
 
+; Root filesystem usage bar, from statfs("/")
+emit_disk_line:
+    call sample_disk
+    call emit_sep_if_needed
+
+    mov rsi, disk_label
+    call emit_str
+
+    mov rdi, [disk_percent]
+    call emit_bar
+    mov al, ' '
+    call emit_char
+
+    mov rdi, [disk_percent]
+    call emit_percent_colored
+    mov al, ' '
+    call emit_char
+
+    mov rax, [disk_used]
+    mov rcx, 1024 * 1024 * 1024
+    call emit_fixed1
+    mov rsi, slash_sep
+    call emit_str
+    mov rax, [disk_total]
+    mov rcx, 1024 * 1024 * 1024
+    call emit_fixed1
+    mov rsi, gb_suffix
+    call emit_str
+    mov rsi, disk_root_label
+    call emit_str
+
+    call emit_nl
+    ret
+
 ; Hostname, kernel version, uptime and load average
 emit_sys_block:
     mov eax, SYS_uname
     mov rdi, utsname_buf
     syscall
 
+    call emit_sep_if_needed
     mov rsi, sys_label
     call emit_str
 
@@ -1247,12 +1411,36 @@ emit_sys_block:
     mov rsi, sep2
     call emit_str
 
+    ; OS pretty name from /etc/os-release, if present
+    mov rdi, os_release_path
+    mov rsi, os_release_buf
+    mov edx, 2047
+    call read_whole_file
+    test rax, rax
+    jle .no_os_release
+    mov rdi, os_release_buf
+    mov rsi, key_pretty_name
+    call find_env_field
+    test rdx, rdx
+    jz .no_os_release
+    mov rsi, rax
+    mov dl, '"'
+    call emit_field_until
+    mov rsi, sep2
+    call emit_str
+.no_os_release:
+
     lea rsi, [utsname_buf]       ; sysname
     mov dl, 0
     call emit_field_until
     mov al, ' '
     call emit_char
     lea rsi, [utsname_buf + 130] ; release
+    mov dl, 0
+    call emit_field_until
+    mov al, ' '
+    call emit_char
+    lea rsi, [utsname_buf + 260] ; machine
     mov dl, 0
     call emit_field_until
     call emit_nl
@@ -1334,9 +1522,38 @@ emit_sys_block:
     call emit_char
     inc rsi
     call emit_field_until
+    call emit_procs_count
 .no_load:
 
     call emit_nl
+    ret
+
+; rsi = pointer at/after the third loadavg field (e.g. " 1/234 5678")
+; Emits "  procs N" using the total-processes half of the "running/total" field.
+emit_procs_count:
+    push rax
+    push rcx
+    push rdx
+.find_slash:
+    cmp byte [rsi], 0
+    je .done
+    cmp byte [rsi], 10
+    je .done
+    cmp byte [rsi], '/'
+    je .got
+    inc rsi
+    jmp .find_slash
+.got:
+    inc rsi
+    mov rdi, rsi
+    call parse_uint_adv
+    mov rsi, procs_prefix
+    call emit_str
+    call emit_num
+.done:
+    pop rdx
+    pop rcx
+    pop rax
     ret
 
 ; rdi = percentage (0-100+, capped at 100 for the bar)
